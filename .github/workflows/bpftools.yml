@@ -8,9 +8,8 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        env:
-          - ARCH: arm64
-          - ARCH: x86_64
+        arch: [arm64, x86_64]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -21,62 +20,98 @@ jobs:
         run: ./scripts/download-ndk.sh
 
       - name: Build
-        env: ${{ matrix.env }}
-        run: make bpftools NDK_PATH=`pwd`/android-ndk-r27b NDK_ARCH=${{ matrix.env['ARCH'] }}
-
-      - name: Bundle missing libclang-cpp.so into bpftools archive
-        env: ${{ matrix.env }}
         run: |
           set -euo pipefail
 
-          ARCHIVE="bpftools-${{ matrix.env['ARCH'] }}.tar.gz"
+          make bpftools \
+            NDK_PATH="$(pwd)/android-ndk-r27b" \
+            NDK_ARCH="${{ matrix.arch }}" \
+            LLVM_SHARED=true \
+            ENABLE_LLVM_SHARED=true \
+            LLVM_BUILD_LLVM_DYLIB=true \
+            LLVM_LINK_LLVM_DYLIB=true \
+            CLANG_LINK_CLANG_DYLIB=true
+
+      - name: Verify bpftools archive LLVM linking
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="bpftools-${{ matrix.arch }}.tar.gz"
           WORK="$(mktemp -d)"
 
           tar -xzf "$ARCHIVE" -C "$WORK"
 
-          LIBDIR="$(find "$WORK" -type d -name lib | head -1)"
-          test -n "$LIBDIR" || { echo "lib directory not found in archive"; exit 1; }
+          echo "===== archive files of interest ====="
+          find "$WORK" -type f \( \
+            -name 'bpftrace' -o \
+            -name 'libbcc.so' -o \
+            -name 'libbcc.so.*' -o \
+            -name 'libclang.so' -o \
+            -name 'libclang.so.*' -o \
+            -name 'libclang-cpp.so' -o \
+            -name 'libclang-cpp.so.*' -o \
+            -name 'libLLVM*.so' -o \
+            -name 'libLLVM*.so.*' \
+          \) -print || true
 
-          if ! find "$LIBDIR" -maxdepth 1 -name 'libclang-cpp.so*' | grep -q .; then
-            SRC="$(find "$PWD" out android-ndk-r27b -name 'libclang-cpp.so*' 2>/dev/null | head -1)"
-            test -n "$SRC" || { echo "libclang-cpp.so not found in build tree"; exit 1; }
+          echo
+          echo "===== NEEDED entries ====="
+          while IFS= read -r f; do
+            file "$f" 2>/dev/null | grep -q ELF || continue
 
-            echo "bundling $SRC -> $LIBDIR/"
-            cp -av "$SRC" "$LIBDIR/"
+            case "$f" in
+              *bpftrace|*libbcc.so|*libbcc.so.*|*libclang.so|*libclang.so.*|*libclang-cpp.so|*libclang-cpp.so.*|*libLLVM*.so|*libLLVM*.so.*)
+                echo "===== $f ====="
+                readelf -d "$f" 2>/dev/null | grep NEEDED || true
+                ;;
+            esac
+          done < <(find "$WORK" -type f)
 
-            if [ ! -e "$LIBDIR/libclang-cpp.so" ]; then
-              ln -s "$(basename "$SRC")" "$LIBDIR/libclang-cpp.so" || cp -av "$SRC" "$LIBDIR/libclang-cpp.so"
-            fi
+          echo
+          echo "===== check libclang-cpp.so location ====="
+          if ! find "$WORK" -type f -path '*/lib/libclang-cpp.so*' | grep -q .; then
+            echo "ERROR: libclang-cpp.so not found under lib/"
+            echo "Do not fix this by copying random libclang-cpp.so after build."
+            echo "Fix the build so clang/LLVM shared libs are produced correctly."
+            exit 1
           fi
 
-          tar -czf "$ARCHIVE" -C "$WORK" .
+          echo
+          echo "===== check duplicate LLVM BPF option marker ====="
+          COUNT=0
 
-      - name: Verify bpftools archive has clang libs
-        env: ${{ matrix.env }}
-        run: |
-          set -euo pipefail
+          while IFS= read -r f; do
+            file "$f" 2>/dev/null | grep -q ELF || continue
 
-          ARCHIVE="bpftools-${{ matrix.env['ARCH'] }}.tar.gz"
+            if strings "$f" 2>/dev/null | grep -q 'disable-bpf-peephole'; then
+              echo "FOUND in $f"
+              COUNT=$((COUNT + 1))
+            fi
+          done < <(find "$WORK" -type f)
 
-          echo "checking libclang.so..."
-          tar -tzf "$ARCHIVE" | grep -E '(^|/)libclang\.so(\.|$)'
-
-          echo "checking libclang-cpp.so..."
-          tar -tzf "$ARCHIVE" | grep -E '(^|/)libclang-cpp\.so(\.|$)'
+          if [ "$COUNT" -gt 1 ]; then
+            echo
+            echo "ERROR: LLVM appears to be embedded in multiple ELF files."
+            echo "This will cause Android runtime crash:"
+            echo "  Option 'disable-bpf-peephole' registered more than once"
+            echo
+            echo "Fix build flags so bpftrace/bcc/clang share one libLLVM.so."
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: bpftools-android-${{ matrix.env['ARCH'] }}.tar.gz
-          path: bpftools-${{ matrix.env['ARCH'] }}.tar.gz
+          name: bpftools-android-${{ matrix.arch }}.tar.gz
+          path: bpftools-${{ matrix.arch }}.tar.gz
 
   build_bpftools_min:
     name: Build bpftools-min archive
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        env:
-          - ARCH: arm64
-          - ARCH: x86_64
+        arch: [arm64, x86_64]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -87,63 +122,98 @@ jobs:
         run: ./scripts/download-ndk.sh
 
       - name: Build
-        env: ${{ matrix.env }}
-        run: make bpftools-min NDK_PATH=`pwd`/android-ndk-r27b NDK_ARCH=${{ matrix.env['ARCH'] }}
-
-      - name: Bundle missing libclang-cpp.so into bpftools-min archive
-        env: ${{ matrix.env }}
         run: |
           set -euo pipefail
 
-          ARCHIVE="bpftools-min-${{ matrix.env['ARCH'] }}.tar.gz"
+          make bpftools-min \
+            NDK_PATH="$(pwd)/android-ndk-r27b" \
+            NDK_ARCH="${{ matrix.arch }}" \
+            LLVM_SHARED=true \
+            ENABLE_LLVM_SHARED=true \
+            LLVM_BUILD_LLVM_DYLIB=true \
+            LLVM_LINK_LLVM_DYLIB=true \
+            CLANG_LINK_CLANG_DYLIB=true
+
+      - name: Verify bpftools-min archive LLVM linking
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="bpftools-min-${{ matrix.arch }}.tar.gz"
           WORK="$(mktemp -d)"
 
           tar -xzf "$ARCHIVE" -C "$WORK"
 
-          LIBDIR="$(find "$WORK" -type d -name lib | head -1)"
-          test -n "$LIBDIR" || { echo "lib directory not found in archive"; exit 1; }
+          echo "===== archive files of interest ====="
+          find "$WORK" -type f \( \
+            -name 'bpftrace' -o \
+            -name 'libbcc.so' -o \
+            -name 'libbcc.so.*' -o \
+            -name 'libclang.so' -o \
+            -name 'libclang.so.*' -o \
+            -name 'libclang-cpp.so' -o \
+            -name 'libclang-cpp.so.*' -o \
+            -name 'libLLVM*.so' -o \
+            -name 'libLLVM*.so.*' \
+          \) -print || true
 
-          if ! find "$LIBDIR" -maxdepth 1 -name 'libclang-cpp.so*' | grep -q .; then
-            SRC="$(find "$PWD" out android-ndk-r27b -name 'libclang-cpp.so*' 2>/dev/null | head -1)"
-            test -n "$SRC" || { echo "libclang-cpp.so not found in build tree"; exit 1; }
+          echo
+          echo "===== NEEDED entries ====="
+          while IFS= read -r f; do
+            file "$f" 2>/dev/null | grep -q ELF || continue
 
-            echo "bundling $SRC -> $LIBDIR/"
-            cp -av "$SRC" "$LIBDIR/"
+            case "$f" in
+              *bpftrace|*libbcc.so|*libbcc.so.*|*libclang.so|*libclang.so.*|*libclang-cpp.so|*libclang-cpp.so.*|*libLLVM*.so|*libLLVM*.so.*)
+                echo "===== $f ====="
+                readelf -d "$f" 2>/dev/null | grep NEEDED || true
+                ;;
+            esac
+          done < <(find "$WORK" -type f)
 
-            if [ ! -e "$LIBDIR/libclang-cpp.so" ]; then
-              ln -s "$(basename "$SRC")" "$LIBDIR/libclang-cpp.so" || cp -av "$SRC" "$LIBDIR/libclang-cpp.so"
-            fi
+          echo
+          echo "===== check libclang-cpp.so location ====="
+          if ! find "$WORK" -type f -path '*/lib/libclang-cpp.so*' | grep -q .; then
+            echo "ERROR: libclang-cpp.so not found under lib/"
+            echo "Do not fix this by copying random libclang-cpp.so after build."
+            echo "Fix the build so clang/LLVM shared libs are produced correctly."
+            exit 1
           fi
 
-          tar -czf "$ARCHIVE" -C "$WORK" .
+          echo
+          echo "===== check duplicate LLVM BPF option marker ====="
+          COUNT=0
 
-      - name: Verify bpftools-min archive has clang libs
-        env: ${{ matrix.env }}
-        run: |
-          set -euo pipefail
+          while IFS= read -r f; do
+            file "$f" 2>/dev/null | grep -q ELF || continue
 
-          ARCHIVE="bpftools-min-${{ matrix.env['ARCH'] }}.tar.gz"
+            if strings "$f" 2>/dev/null | grep -q 'disable-bpf-peephole'; then
+              echo "FOUND in $f"
+              COUNT=$((COUNT + 1))
+            fi
+          done < <(find "$WORK" -type f)
 
-          echo "checking libclang.so..."
-          tar -tzf "$ARCHIVE" | grep -E '(^|/)libclang\.so(\.|$)'
-
-          echo "checking libclang-cpp.so..."
-          tar -tzf "$ARCHIVE" | grep -E '(^|/)libclang-cpp\.so(\.|$)'
+          if [ "$COUNT" -gt 1 ]; then
+            echo
+            echo "ERROR: LLVM appears to be embedded in multiple ELF files."
+            echo "This will cause Android runtime crash:"
+            echo "  Option 'disable-bpf-peephole' registered more than once"
+            echo
+            echo "Fix build flags so bpftrace/bcc/clang share one libLLVM.so."
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: bpftools-min-android-${{ matrix.env['ARCH'] }}.tar.gz
-          path: bpftools-min-${{ matrix.env['ARCH'] }}.tar.gz
+          name: bpftools-min-android-${{ matrix.arch }}.tar.gz
+          path: bpftools-min-${{ matrix.arch }}.tar.gz
 
   build_bpftrace_static:
     name: Build static bpftrace binaries
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        env:
-          - ARCH: arm64
-          - ARCH: x86_64
-          - ARCH: armv7
+        arch: [arm64, x86_64, armv7]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -154,10 +224,38 @@ jobs:
         run: ./scripts/download-ndk.sh
 
       - name: Build
-        env: ${{ matrix.env }}
-        run: make bpftrace NDK_PATH=`pwd`/android-ndk-r27b NDK_ARCH=${{ matrix.env['ARCH'] }} STATIC_LINKING=true LLVM_BPF_ONLY=true
+        run: |
+          set -euo pipefail
+
+          make bpftrace \
+            NDK_PATH="$(pwd)/android-ndk-r27b" \
+            NDK_ARCH="${{ matrix.arch }}" \
+            STATIC_LINKING=true \
+            LLVM_BPF_ONLY=true
+
+      - name: Verify static bpftrace binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN="out/android/${{ matrix.arch }}/bin/bpftrace"
+
+          echo "===== file ====="
+          file "$BIN"
+
+          echo
+          echo "===== dynamic deps, if any ====="
+          readelf -d "$BIN" 2>/dev/null | grep NEEDED || true
+
+          echo
+          echo "===== LLVM BPF marker ====="
+          if strings "$BIN" 2>/dev/null | grep -q 'disable-bpf-peephole'; then
+            echo "FOUND in $BIN"
+          else
+            echo "not found"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: bpftrace-android-${{ matrix.env['ARCH'] }}
-          path: out/android/${{ matrix.env['ARCH'] }}/bin/bpftrace
+          name: bpftrace-android-${{ matrix.arch }}
+          path: out/android/${{ matrix.arch }}/bin/bpftrace
